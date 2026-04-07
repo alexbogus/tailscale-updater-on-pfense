@@ -1,5 +1,5 @@
 #!/bin/sh
-# Versión 3.1 - Mejoras: Notificaciones nativas en el GUI de pfSense.
+# Versión 3.2 - Mejoras: Corrección de encodado, lógica de notificaciones y eficiencia.
 
 set -e
 set -u
@@ -19,27 +19,29 @@ log() {
     local msg="[$(date +'%Y-%m-%d %H:%M:%S')] $*"
     echo "$msg"
     echo "$msg" >> "$LOG_FILE"
-    # Rotar log: mantener últimas 1000 líneas
-    if [ $(wc -l < "$LOG_FILE" 2>/dev/null || echo 0) -gt 1500 ]; then
+    # Rotar log: mantener últimas 1000 líneas si supera las 1500
+    if [ -f "$LOG_FILE" ] && [ $(wc -l < "$LOG_FILE" 2>/dev/null || echo 0) -gt 1500 ]; then
         tail -n 1000 "$LOG_FILE" > "${LOG_FILE}.tmp" && mv "${LOG_FILE}.tmp" "$LOG_FILE"
     fi
 }
 
 send_pfsense_notice() {
     local notice_msg="$*"
-    # Disparar notificación nativa en el GUI de pfSense vía PHP
+    # Eliminamos acentos conflictivos para asegurar compatibilidad con el GUI de pfSense
+    clean_msg=$(echo "$notice_msg" | tr 'áéíóúÁÉÍÓÚ' 'aeiouAEIOU')
+    
     /usr/local/bin/php -q <<EOF
 <?php
 require_once("notices.inc");
-file_notice("TailscaleUpdate", "$notice_msg", "Tailscale Update System", "index.php");
+// Usamos add_notice si queremos que persista o file_notice para el log general
+file_notice("TailscaleUpdate", "$clean_msg", "Tailscale Update System", "index.php");
 ?>
 EOF
 }
 
 error_exit() {
     log "ERROR: $*"
-    # También notificamos errores críticos en el GUI
-    send_pfsense_notice "Error crítico en actualización de Tailscale: $*"
+    send_pfsense_notice "Error critico en actualizacion de Tailscale: $*"
     exit 1
 }
 
@@ -53,8 +55,9 @@ cleanup() {
 # ---------------------------------------------
 if [ -f "$LOCK_FILE" ]; then
     OLDPID=$(cat "$LOCK_FILE" 2>/dev/null || echo "0")
-    if kill -0 "$OLDPID" 2>/dev/null; then
-        error_exit "Script ya en ejecución (PID $OLDPID)."
+    if [ "$OLDPID" -ne 0 ] && kill -0 "$OLDPID" 2>/dev/null; then
+        # Salida silenciosa si ya corre para no saturar logs
+        exit 0
     fi
 fi
 echo $$ > "$LOCK_FILE"
@@ -65,13 +68,10 @@ trap cleanup EXIT INT TERM
 # ---------------------------------------------
 [ "$(id -u)" -ne 0 ] && error_exit "Se requiere root."
 
-# Detección dinámica de versión y arquitectura
 FREEBSD_VER=$(uname -r | cut -d'-' -f1 | cut -d'.' -f1)
 ARCH=$(uname -m)
 REPO_BASE="https://pkg.freebsd.org/FreeBSD:${FREEBSD_VER}:${ARCH}/latest"
 DB_URL="${REPO_BASE}/packagesite.pkg"
-
-log "--- Iniciando ciclo (FreeBSD $FREEBSD_VER $ARCH) ---"
 
 # ---------------------------------------------
 # Detección de Versiones
@@ -84,34 +84,35 @@ fi
 
 WORKDIR=$(mktemp -d -t tailscale_upd_XXXXXX)
 
-# Descarga del índice con reintentos
-log "Consultando repositorio remoto..."
+# Descarga del índice
 success=0
 for i in $(seq 1 $MAX_RETRIES); do
     if fetch -m -q -o "${WORKDIR}/packagesite.pkg" "$DB_URL"; then
         success=1 && break
     fi
-    log "Reintento de conexión $i/$MAX_RETRIES..."
     sleep 3
 done
-[ $success -eq 0 ] && error_exit "Fallo de red persistente al conectar con FreeBSD Repo."
 
-# Parseo de datos del paquete
+[ $success -eq 0 ] && error_exit "Fallo de red al conectar con FreeBSD Repo."
+
+# Extraer info del paquete
 RAW_DATA=$(tar -xf "${WORKDIR}/packagesite.pkg" -O 2>/dev/null | grep -m 1 "\"name\":\"${PKG_NAME}\"")
-[ -z "$RAW_DATA" ] && error_exit "No se encontró el paquete $PKG_NAME en el repositorio."
+[ -z "$RAW_DATA" ] && error_exit "No se encontro el paquete $PKG_NAME."
 
 LATEST_VER=$(echo "$RAW_DATA" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
-LATEST_PATH=$(echo "$RAW_DATA" | sed -n 's/.*"path":"\([^"]*\)".*/\1/p')
+LATEST_PATH=$(echo "$RAW_DATA" | sed -n 's/.*"version":"'${LATEST_VER}'","path":"\([^"]*\)".*/\1/p')
 
-# Comparación semántica
+# COMPARACIÓN CRÍTICA
 VER_CHECK=$(pkg-static version -t "$CURRENT_VER" "$LATEST_VER")
 
-if [ "$VER_CHECK" = "=" ] || [ "$VER_CHECK" = ">" ]; then
-    log "Sistema al día ($CURRENT_VER). Saliendo."
+if [ "$VER_CHECK" != "<" ]; then
+    # Si la versión es igual (=) o la instalada es mayor (>), no hacemos nada.
+    # No enviamos notificación al GUI para evitar el spam que ves en tu captura.
+    cleanup
     exit 0
 fi
 
-log "Nueva versión detectada: $LATEST_VER (Actual instalada: $CURRENT_VER)"
+log "Nueva version detectada: $LATEST_VER (Actual: $CURRENT_VER). Iniciando descarga..."
 
 # ---------------------------------------------
 # Proceso de Instalación
@@ -119,13 +120,11 @@ log "Nueva versión detectada: $LATEST_VER (Actual instalada: $CURRENT_VER)"
 PKG_URL="${REPO_BASE}/${LATEST_PATH}"
 PKG_FILE="${WORKDIR}/$(basename "$LATEST_PATH")"
 
-log "Descargando paquete..."
 fetch -q -o "$PKG_FILE" "$PKG_URL" || error_exit "Error descargando el archivo .pkg"
 
-log "Instalando (IGNORE_OSVERSION)..."
 export IGNORE_OSVERSION=yes
 if ! pkg-static add -f "$PKG_FILE"; then
-    error_exit "La instalación del paquete falló."
+    error_exit "La instalacion del paquete fallo."
 fi
 
 # ---------------------------------------------
@@ -140,16 +139,14 @@ else
     service tailscaled start >/dev/null
 fi
 
-# Verificación final
+# Verificación final y ÚNICA notificación de éxito
 if tailscale version >/dev/null 2>&1; then
     NEW_VER_STR=$(tailscale version | head -n 1)
-    log "Actualización completada: $NEW_VER_STR"
-    # NOTIFICACIÓN GUI
-    send_pfsense_notice "Tailscale se ha actualizado con éxito a la versión $LATEST_VER ($NEW_VER_STR)."
+    log "Actualizacion completada: $NEW_VER_STR"
+    # Ahora sí notificamos al GUI porque hubo un cambio real
+    send_pfsense_notice "Tailscale actualizado con exito a la version $LATEST_VER ($NEW_VER_STR)."
 else
-    error_exit "El paquete se instaló pero el binario no responde."
+    error_exit "El binario no responde tras la instalacion."
 fi
 
 [ -f "/root/tailscale_start.sh" ] && /bin/sh /root/tailscale_start.sh
-
-log "Script finalizado."
